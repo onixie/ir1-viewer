@@ -14,9 +14,9 @@
 (defvar *flow-width* (/ *screen-width* 2))
 (defvar *flow-height* *screen-height*)
 
-(defvar *flow-unit* 30)
+(defvar *flow-unit* 40)
 (defvar *flow-x-spacing* *flow-unit*)
-(defvar *flow-y-spacing* (* *flow-unit* 2))
+(defvar *flow-y-spacing* *flow-unit*)
 
 (defvar *copy-of-continuation-numbers* nil)
 (defvar *copy-of-number-continuations* nil)
@@ -72,37 +72,23 @@
 		   ,@body)))
      (bounding-rectangle-size record)))
 
+(defun component-clambdas (component)
+  (remove-duplicates
+   (append (sb-c::component-new-functionals component)
+	   (sb-c::component-lambdas component)
+	   (sb-c::component-reanalyze-functionals component))))
+
 ;;; IR1 Regions
 (defvar *recompute-p* nil)
 (defvar *ir1-flow* nil)
 
 (defun make-ir1-flow (clambda)
-  (labels ((make (clambda)
-	     (let ((flow-original-x *flow-current-x*)
-		   (flow-original-y *flow-current-y*)
-		   (*flow-current-x* *flow-current-x*)
-		   (*flow-current-y* *flow-current-y*)
-		   (*ir1-flow* (make-hash-table)))
-	       (let ((clambda-region (region-ir1 clambda)))
-		 (when (minusp (min-x clambda-region))
-		   (setf *flow-current-x* (- flow-original-x (min-x clambda-region))))
-		 (when (minusp (min-y clambda-region))
-		   (setf *flow-current-y* (- flow-original-y (min-y clambda-region))))
-		 (region-ir1 clambda :recompute-p :recursive))
-	       (cons clambda *ir1-flow*)))
-	   (top-of (clambda)
-	     (if (sb-c::lambda-parent clambda)
-		 (top-of (sb-c::lambda-parent clambda))
-		 clambda))
-	   (descended-of (clambda)
-	     (when clambda
-	       (cons clambda (mapcan #'descended-of (sb-c::lambda-children clambda))))))
-    (let ((clambdas (remove-duplicates (append (descended-of (top-of clambda))
-					       (list (sb-c::lambda-entry-fun clambda))
-					       (sb-c::lambda-lets clambda)
-					       (sb-c::tail-set-funs (sb-c::lambda-tail-set clambda))
-					       (remove-if-not #'sb-c::functional-p (concatenate 'list (sb-c::sset-vector (sb-c::lambda-calls-or-closes clambda))))))))
-      (mapcar #'make clambdas))))
+  (let ((component (sb-c::lambda-component clambda))
+	(*flow-current-x* *flow-current-x*)
+	(*flow-current-y* *flow-current-y*)
+	(*ir1-flow* (make-hash-table)))
+    (region-ir1 component)
+    (cons component *ir1-flow*)))
 
 (defun valid-region-p (region)
   (and region (not (eq region +nowhere+)) region))
@@ -124,8 +110,8 @@
      (if ,ir1
 	 (or (and (not recompute-p) (gethash ,ir1 ir1-flow nil))
 	     (setf (gethash ,ir1 ir1-flow)
-		   (let ((*recompute-p* (and ,recursively-recompute-p 
-					     (eq recompute-p :recursive) 
+		   (let ((*recompute-p* (and ,recursively-recompute-p
+					     (eq recompute-p :recursive)
 					     :recursive))
 			 (*ir1-flow* ir1-flow))
 		     ,@body)))
@@ -141,10 +127,7 @@
     (sb-c::node (region-node ir1))
     (t +nowhere+)))
 
-(define-ir1-region (clambda) 
-  (margined-region (region-component (sb-c::lambda-component clambda))))
-
-(define-ir1-region (component) 
+(define-ir1-region (component)
   (let ((flow-original-x *flow-current-x*))
     (labels ((region-cblocks (cblock-head region)
 	       (let ((*flow-current-x* *flow-current-x*))
@@ -158,7 +141,7 @@
 		     (when (valid-region-p region)
 		       (setf *flow-current-x* (+ flow-original-x
 						 (bounding-rectangle-width region)
-						 *flow-x-spacing*)))))))
+						 (* 2 *flow-x-spacing*))))))))
 	     (region-lvars (cblock-head)
 	       (do ((cblocks (next-of cblock-head) (rest cblocks)))
 		   ((null cblocks))
@@ -167,9 +150,20 @@
 		       (lvar (and (sb-c::valued-node-p node) (sb-c::node-lvar node)) (and (sb-c::valued-node-p node) (sb-c::node-lvar node))))
 		      ((null ctran))
 		   (region-lvar lvar))
-		 (region-lvars (first cblocks)))))
-      (prog1 (margined-region (region-cblocks (sb-c::component-head component) +nowhere+))
+		 (region-lvars (first cblocks))))
+	     (region-clambdas ()
+	       (region-cblocks (sb-c::component-head component) +nowhere+)
+	       (reduce #'region-union
+		       (mapcar #'region-clambda
+			       (component-clambdas component)))))
+      (prog1 (margined-region (region-clambdas))
 	(region-lvars (sb-c::component-head component))))))
+
+(define-ir1-region (clambda)
+  (do* ((cblock (sb-c::lambda-block clambda) (sb-c::block-next cblock))
+	(region (region-cblock cblock) (region-union region (region-cblock cblock))))
+       ((eq cblock (sb-c::node-block (sb-c::lambda-return clambda)))
+	(margined-region (region-union region (reduce #'region-union (mapcar #'region-clambda (sb-c::lambda-children clambda)) :initial-value +nowhere+)) :x-ratio 1/3 :y-ratio 1/3))))
 
 (define-ir1-region (cblock)
   (do* ((region +nowhere+ (region-union region (region-union (region-node node) (bounding-rectangle (region-ctran ctran)))))
@@ -250,8 +244,7 @@
   (defparameter +flow-view+ (make-instance 'flow-view)))
 
 (define-application-frame ir1-viewer ()
-  ((ir1-flow :reader ir1-flow :initarg :ir1-flow)
-   (cur-flow :accessor cur-flow :initform nil))
+  ((ir1-flow :reader ir1-flow :initarg :ir1-flow))
   (:panes
    (flow :application
 	 :display-function #'draw-flow
@@ -265,13 +258,6 @@
 	 :display-time nil
 	 :width *flow-width*
 	 :default-view +textual-view+)
-   (select (make-pane 'option-pane
-		      :name "select"
-		      :value (setf (cur-flow *application-frame*) (cdar (ir1-flow *application-frame*)))
-		      :items (ir1-flow *application-frame*)
-		      :name-key (lambda (flow) (label-ir1 (car flow)))
-		      :value-key #'cdr
-		      :value-changed-callback #'select-flow))
    (quit :push-button
 	 :label "Quit"
 	 :activate-callback #'exit-viewer))
@@ -279,7 +265,6 @@
    (default
        (horizontally ()
 	 (vertically ()
-	   select
 	   flow)
 	 (vertically ()
 	   info
@@ -287,34 +272,26 @@
 
 (defun view (clambda)
   (let ((ir1-flow (make-ir1-flow clambda)))
-    (find-application-frame (label-ir1 clambda) :ir1-flow ir1-flow :create t :own-process t :frame-class 'ir1-viewer)))
+    (find-application-frame 'ir1-viewer :ir1-flow ir1-flow :create t :own-process t :frame-class 'ir1-viewer)))
 
 (defun exit-viewer (&rest args)
   (declare (ignore args))
   (frame-exit *application-frame*))
 
-(defun select-flow (pane value)
-  (declare (ignore pane))
-  (setf (cur-flow *application-frame*) value)
-  (redisplay-frame-pane *application-frame* 'flow :force-p t))
-
 (defun draw-flow (frame stream)
   (window-clear stream)
-  (let ((*ir1-flow* (cur-flow frame)))
-    (loop for ir1 being each hash-key in *ir1-flow*
-       do (progn
-	    (present ir1 (presentation-type-of ir1) :stream stream)
-	    (draw-ir1-extra ir1 stream)))))
+  (let ((component-region (region-component (car (ir1-flow frame)))))
+    (with-translation (stream (- (min-x component-region)) (- (min-y component-region)))
+      (loop for ir1 being each hash-key in (cdr (ir1-flow frame))
+	 do (progn
+	      (present ir1 (presentation-type-of ir1) :stream stream)
+	      (draw-ir1-extra ir1 stream))))))
 
 (define-ir1-viewer-command com-describe ((ir1 'ir1))
   (let ((stream (get-frame-pane *application-frame* 'info)))
     (window-clear stream)
     (handler-case (describe ir1 stream)
       (error (e) (notify-user *application-frame* (format nil "~a" e))))))
-
-(define-ir1-viewer-command com-view ((ir1 'sb-c::clambda))
-  (setf (gadget-value (find-pane-named *application-frame* 'select) :invoke-callback t)
-	(cdr (assoc ir1 (ir1-flow *application-frame*)))))
 
 (labels ((present-instance-slots-clim (thing stream)
            (let ((slots (clim-mop:class-slots (class-of thing))))
@@ -385,9 +362,6 @@
 (define-presentation-to-command-translator describe (ir1 com-describe ir1-viewer :gesture :select) (object)
   `(,object))
 
-(define-presentation-to-command-translator view (sb-c::clambda com-view ir1-viewer :gesture nil) (object)
-  `(,object))
-
 (defmethod print-object :around ((ctran sb-c::ctran) stream)
   (let ((sb-c::*continuation-numbers* *copy-of-continuation-numbers*)
 	( sb-c::*number-continuations* *copy-of-number-continuations*))
@@ -437,7 +411,7 @@
 	       (with-valid-region (region-component component)
 		 (let* ((component-height (- (max-y it) (min-y it)))
 			(lvar-length (sqrt (+ (* (- x2 x1) (- x2 x1)) (* (- y2 y1) (- y2 y1)))))
-			(lvar-shift (/ (* 4 *flow-x-spacing* lvar-length) component-height)))
+			(lvar-shift (/ (* 3 *flow-x-spacing* lvar-length) component-height)))
 		   (draw-line* stream
 			       x1 y1
 			       (- x1 lvar-shift) (if (> y1 y2) (- y1 lvar-shift) (+ y1 lvar-shift))
@@ -500,7 +474,7 @@
   (:method ((ir1 t)) ""))
 
 (defmethod label-ir1 ((ir1 sb-c::clambda))
-  (format nil "~a:~a" (type-of ir1) (sb-c::lambda-%debug-name ir1)))
+  (format nil "~a:~a" (type-of ir1) (or (sb-c::lambda-%debug-name ir1) (sb-c::lambda-%source-name ir1))))
 
 (defmethod label-ir1 ((ir1 sb-c::component))
   (format nil "~a:~a" (type-of ir1) (sb-c::component-name ir1)))
@@ -543,4 +517,6 @@
 		(print-log "viewing ~a~%" clambda)
 		(signal 'view-ir1 :clambda clambda)
 		clambda)))))
-       ,form-being-compiled)))
+       (if (eq ',(car form-being-compiled) 'lambda)
+	   ,form-being-compiled
+	   (lambda () ,form-being-compiled)))))
