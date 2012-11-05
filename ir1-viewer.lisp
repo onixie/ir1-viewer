@@ -14,15 +14,33 @@
 (defvar *flow-width* (/ *screen-width* 2))
 (defvar *flow-height* *screen-height*)
 
-(defvar *flow-unit* 40)
+(defvar *flow-unit* (/ *screen-width* 40))
+
 (defvar *flow-x-spacing* *flow-unit*)
 (defvar *flow-y-spacing* *flow-unit*)
+(defvar *flow-block-x-spacing* (* 2 *flow-x-spacing*))
+(defvar *flow-block-y-spacing* *flow-y-spacing*)
+
+(defvar *flow-lvar-x-spacing-ratio* 3)
+
+(defvar *flow-margin-ratio-x* 1)
+(defvar *flow-margin-ratio-y* 1)
+(defvar *flow-clambda-margin-ratio-x* 1/3)
+(defvar *flow-clambda-margin-ratio-y* 1/3)
+(defvar *flow-block-margin-ratio-x* 2)
+(defvar *flow-block-margin-ratio-y* 0)
 
 (defvar *copy-of-continuation-numbers* nil)
 (defvar *copy-of-number-continuations* nil)
 
 (defparameter *flow-current-x* 0)
 (defparameter *flow-current-y* 0)
+
+(defparameter *flow-current-scaling* 1)
+
+(defparameter *flow-print-lines* 1)
+(defparameter *flow-print-level* 2)
+(defparameter *flow-print-length* 3)
 
 (defvar *ir1-flow* (make-hash-table))
 
@@ -67,6 +85,33 @@
     (multiple-value-bind (ex ey) (line-end-point* line)
       (make-point (center-of sx ex) (center-of sy ey)))))
 
+(defun draw-text-in-bounding-rectangle* (stream text bound location &rest args)
+  (let ((old-size (getf args :text-size 256))
+	(record (with-output-to-output-record (stream) (apply #'draw-text* stream text
+							      (case location
+								((:bottomleft :topleft) (1+ (min-x bound)))
+								((:bottomright :topright) (1- (max-x bound)))
+								(t (center-of (min-x bound) (max-x bound))))
+							      (case location
+								((:topright :topleft) (1+ (min-y bound)))
+								((:bottomright :bottomleft) (1- (max-y bound)))
+								(t (center-of (min-y bound) (max-y bound)))) args))))
+    (when (or (< (bounding-rectangle-width (bounding-rectangle record)) (* *flow-current-scaling* (bounding-rectangle-width bound)))
+	      (< old-size 4))
+      (apply #'draw-text* stream text
+	     (case location
+	       ((:bottomleft :topleft) (1+ (min-x bound)))
+	       ((:bottomright :topright) (1- (max-x bound)))
+	       (t (center-of (min-x bound) (max-x bound))))
+	     (case location
+	       ((:topright :topleft) (1+ (min-y bound)))
+	       ((:bottomright :bottomleft) (1- (max-y bound)))
+	       (t (center-of (min-y bound) (max-y bound)))) args)
+
+      (return-from draw-text-in-bounding-rectangle* nil))
+    (setf (getf args :text-size) (ceiling (- old-size 1)))
+    (apply #'draw-text-in-bounding-rectangle* stream text bound location args)))
+
 (defmacro size-of ((stream) &body body)
   `(let ((record (with-output-to-output-record (,stream)
 		   ,@body)))
@@ -97,7 +142,7 @@
   `(awhen (valid-region-p ,region)
      ,@body))
 
-(defun margined-region (region &key (x-ratio 1) (y-ratio 1))
+(defun margined-region (region &key (x-ratio *flow-margin-ratio-x*) (y-ratio *flow-margin-ratio-y*))
   (if (valid-region-p region)
       (make-bounding-rectangle (- (min-x region) (* x-ratio *flow-x-spacing*))
 			       (- (min-y region) (* y-ratio *flow-y-spacing*))
@@ -119,7 +164,7 @@
 
 (define-ir1-region (ir1)
   (typecase ir1
-    (sb-c::clambda (region-clambda ir1))
+    (sb-c::functional (region-functional ir1))
     (sb-c::component (region-component ir1))
     (sb-c::cblock (region-cblock ir1))
     (sb-c::ctran (region-ctran ir1))
@@ -129,19 +174,28 @@
 
 (define-ir1-region (component)
   (let ((flow-original-x *flow-current-x*))
-    (labels ((region-cblocks (cblock-head region)
+    (labels ((region-dangling-next-cblocks (cblock-head region)
+	       (or (and (sb-c::block-next cblock-head)
+			(null (sb-c::block-pred (sb-c::block-next cblock-head)))
+			(region-union (region-cblock (sb-c::block-next cblock-head))
+				      (region-dangling-next-cblocks (sb-c::block-next cblock-head) region)))
+		   (region-cblocks cblock-head region)))
+	     (region-cblocks (cblock-head region)
 	       (let ((*flow-current-x* *flow-current-x*))
 		 (do* ((cblocks (next-of cblock-head) (rest cblocks))
 		       (cblock (first cblocks) (first cblocks)))
-		      ((null cblocks) region)
+		      ((null cblocks) (values region *flow-current-x* *flow-current-y*))
 		   (let* ((*flow-current-y* *flow-current-y*)
 			  (cblock-region (region-cblock cblock))
-			  (cblock-succ-region (region-cblocks cblock region)))
-		     (setf region (region-union cblock-region cblock-succ-region))
+			  (cblock-next-region (region-dangling-next-cblocks cblock region))
+					;(cblock-succ-region (region-cblocks cblock region))
+			  )
+		     (setf region (reduce #'region-union (list cblock-region ;; cblock-succ-region
+							       cblock-next-region)))
 		     (when (valid-region-p region)
 		       (setf *flow-current-x* (+ flow-original-x
 						 (bounding-rectangle-width region)
-						 (* 2 *flow-x-spacing*))))))))
+						 *flow-block-x-spacing*)))))))
 	     (region-lvars (cblock-head)
 	       (do ((cblocks (next-of cblock-head) (rest cblocks)))
 		   ((null cblocks))
@@ -151,25 +205,46 @@
 		      ((null ctran))
 		   (region-lvar lvar))
 		 (region-lvars (first cblocks))))
-	     (region-clambdas ()
-	       (region-cblocks (sb-c::component-head component) +nowhere+)
-	       (reduce #'region-union
-		       (mapcar #'region-clambda
-			       (component-clambdas component)))))
-      (prog1 (margined-region (region-clambdas))
+	     (region-functionals ()
+	       (multiple-value-bind (br cx cy) (region-cblocks (sb-c::component-head component) +nowhere+)
+		 (declare (ignore br))
+		 (let ((*flow-current-x* cx)
+		       (*flow-current-y* cy))
+		   (reduce #'region-union
+			   (mapcar #'region-functional
+				   (component-clambdas component))
+			   :initial-value +nowhere+)))))
+      (prog1 (margined-region (region-functionals))
 	(region-lvars (sb-c::component-head component))))))
 
-(define-ir1-region (clambda)
-  (do* ((cblock (sb-c::lambda-block clambda) (sb-c::block-next cblock))
-	(region (region-cblock cblock) (region-union region (region-cblock cblock))))
-       ((eq cblock (sb-c::node-block (sb-c::lambda-return clambda)))
-	(margined-region (region-union region (reduce #'region-union (mapcar #'region-clambda (sb-c::lambda-children clambda)) :initial-value +nowhere+)) :x-ratio 1/3 :y-ratio 1/3))))
+(define-ir1-region (functional)
+  (typecase functional
+    (sb-c::clambda (do* ((cblock (sb-c::lambda-block functional) (sb-c::block-next cblock))
+			 (region (region-cblock cblock) (region-union region (region-cblock cblock))))
+			((eq cblock (sb-c::node-block (sb-c::lambda-return functional)))
+			 (margined-region (region-union region 
+							(reduce #'region-union (mapcar #'region-functional (sb-c::lambda-children functional)) :initial-value +nowhere+))
+					  :x-ratio *flow-clambda-margin-ratio-x*
+					  :y-ratio *flow-clambda-margin-ratio-y*))))
+    (sb-c::optional-dispatch
+     (margined-region
+      (reduce #'region-union
+	      (remove-duplicates
+	       (mapcar #'region-functional
+		       (list*
+			(sb-c::optional-dispatch-main-entry functional)
+			(sb-c::optional-dispatch-more-entry functional)
+			(remove-if-not #'sb-c::functional-p
+				       (sb-c::optional-dispatch-entry-points functional)))))
+	      :initial-value +nowhere+)
+      :x-ratio *flow-clambda-margin-ratio-x*
+      :y-ratio *flow-clambda-margin-ratio-y*))))
 
 (define-ir1-region (cblock)
   (do* ((region +nowhere+ (region-union region (region-union (region-node node) (bounding-rectangle (region-ctran ctran)))))
 	(ctran (sb-c::block-start cblock) (next-of node))
 	(node (next-of ctran) (next-of ctran)))
-       ((null ctran) (margined-region region :x-ratio 2 :y-ratio 0))))
+       ((null ctran) (margined-region region :x-ratio *flow-block-margin-ratio-x* :y-ratio *flow-block-margin-ratio-y*))))
 
 (define-ir1-region (ctran :recursively-recompute-p nil)
   (let ((use (unless (eq (sb-c::ctran-kind ctran) :block-start)
@@ -220,7 +295,7 @@
 				  (+ *flow-current-y* *flow-unit*))
     (setf *flow-current-y* (+ *flow-current-y* *flow-y-spacing*))
     (when (eq node (sb-c::block-last (sb-c::node-block node)))
-      (setf *flow-current-y* (+ *flow-current-y* *flow-y-spacing*)))))
+      (setf *flow-current-y* (+ *flow-current-y* *flow-block-y-spacing*)))))
 
 (defun previous-of (ir1)
   (typecase ir1
@@ -235,7 +310,9 @@
     (sb-c::ctran (sb-c::ctran-next ir1))
     (sb-c::node (sb-c::node-next ir1))
     (sb-c::lvar (sb-c::lvar-dest ir1))
-    (sb-c::cblock (sb-c::block-succ ir1))
+    (sb-c::cblock (if (equal (sb-c::block-succ ir1) (sb-c::block-pred ir1))
+		      (list (sb-c::block-next ir1))
+		      (sb-c::block-succ ir1)))
     (t nil)))
 
 ;;; Clim
@@ -245,53 +322,66 @@
 
 (define-application-frame ir1-viewer ()
   ((ir1-flow :reader ir1-flow :initarg :ir1-flow))
+  (:pointer-documentation t)
   (:panes
    (flow :application
-	 :display-function #'draw-flow
+	 :display-function #'draw-flow-pane
 	 :display-time nil
-	 :width *flow-width*
-	 :height *flow-height*
 	 :end-of-page-action :allow
 	 :scroll-bars :both
 	 :default-view +flow-view+)
    (info :application
 	 :display-time nil
-	 :width *flow-width*
-	 :default-view +textual-view+)
-   (quit :push-button
-	 :label "Quit"
-	 :activate-callback #'exit-viewer))
+	 :scroll-bars :both
+	 :default-view +textual-view+))
   (:layouts
    (default
        (horizontally ()
-	 (vertically ()
-	   flow)
-	 (vertically ()
-	   info
-	   quit)))))
+	 (2/3 flow)
+	 (1/3 info)))
+   (only-flow
+    flow)))
 
-(defun view (clambda)
+(defun run-viewer (clambda)
   (let ((ir1-flow (make-ir1-flow clambda)))
     (find-application-frame 'ir1-viewer :ir1-flow ir1-flow :create t :own-process t :frame-class 'ir1-viewer)))
 
-(defun exit-viewer (&rest args)
-  (declare (ignore args))
-  (frame-exit *application-frame*))
+(defun draw-flow-pane (frame stream)
+  (draw-flow (ir1-flow frame) stream))
 
-(defun draw-flow (frame stream)
+(defun draw-flow (ir1-flow stream &key (view +flow-view+))
   (window-clear stream)
-  (let ((component-region (region-component (car (ir1-flow frame)))))
-    (with-translation (stream (- (min-x component-region)) (- (min-y component-region)))
-      (loop for ir1 being each hash-key in (cdr (ir1-flow frame))
-	 do (progn
-	      (present ir1 (presentation-type-of ir1) :stream stream)
-	      (draw-ir1-extra ir1 stream))))))
+  (let ((component-region (region-component (car ir1-flow))))
+    (with-scaling (stream *flow-current-scaling*)
+      (with-translation (stream (- (min-x component-region)) (- (min-y component-region)))
+	(with-drawing-options (stream)
+	  (loop for ir1 being each hash-key in (cdr ir1-flow)
+	     do (progn
+		  (draw-ir1-extra ir1 stream)
+		  (present ir1 (presentation-type-of ir1) :stream stream :view view))))))))
 
 (define-ir1-viewer-command com-describe ((ir1 'ir1))
-  (let ((stream (get-frame-pane *application-frame* 'info)))
-    (window-clear stream)
-    (handler-case (describe ir1 stream)
-      (error (e) (notify-user *application-frame* (format nil "~a" e))))))
+  (when (eq (frame-current-layout *application-frame*) 'default)
+    (let ((stream (get-frame-pane *application-frame* 'info)))
+      (window-clear stream)
+      (handler-case (describe ir1 stream)
+	(error (e) (notify-user *application-frame* (format nil "~a" e)))))))
+
+(define-ir1-viewer-command (com-zoom-in :menu t :keystroke (:z :shift)) ()
+  (setf *flow-current-scaling* (* 2 *flow-current-scaling*))
+  (redisplay-frame-pane *application-frame* 'flow :force-p t))
+
+(define-ir1-viewer-command (com-zoom-out :menu t :keystroke :z) ()
+  (setf *flow-current-scaling* (/ *flow-current-scaling* 2))
+  (redisplay-frame-pane *application-frame* 'flow :force-p t))
+
+(define-ir1-viewer-command (com-toggle-info :menu t :keystroke :f) ()
+  (if (eq (frame-current-layout *application-frame*) 'default)
+      (setf (frame-current-layout *application-frame*) 'only-flow)
+      (setf (frame-current-layout *application-frame*) 'default)))
+
+(define-ir1-viewer-command (com-quit :menu t :keystroke :q) ()
+  (frame-exit *application-frame*))
 
 (labels ((present-instance-slots-clim (thing stream)
            (let ((slots (clim-mop:class-slots (class-of thing))))
@@ -315,6 +405,7 @@
            (clim:present (type-of thing) (clim:presentation-type-of (type-of thing))
                          :stream stream)
            (terpri stream)
+	   (terpri stream)
            (format stream "It has the following slots:~%")
 	   (present-instance-slots-clim thing stream)))
   
@@ -343,7 +434,7 @@
 (define-ir1-presentation-type (ir1) ())
 
 (define-ir1-presentation-type (sb-c::cblock
-			       sb-c::clambda
+			       sb-c::functional
 			       sb-c::component
 			       sb-c::ctran
 			       sb-c::lvar
@@ -353,29 +444,29 @@
 (define-ir1-presentation-type (sb-c::bind
 			       sb-c::cast
 			       sb-c::cif
-			       sb-c::combination
 			       sb-c::creturn
 			       sb-c::entry
 			       sb-c::exit
-			       sb-c::ref) () :inherit-from 'sb-c::node)
+			       sb-c::ref
+			       sb-c::basic-combination) () :inherit-from 'sb-c::node)
+
+(define-ir1-presentation-type (sb-c::combination
+			       sb-c::mv-combination) () :inherit-from 'sb-c::basic-combination)
+
+(define-ir1-presentation-type (sb-c::clambda
+			       sb-c::optional-dispatch) () :inherit-from 'sb-c::functional)
 
 (define-presentation-to-command-translator describe (ir1 com-describe ir1-viewer :gesture :select) (object)
   `(,object))
 
-(defmethod print-object :around ((ctran sb-c::ctran) stream)
-  (let ((sb-c::*continuation-numbers* *copy-of-continuation-numbers*)
-	( sb-c::*number-continuations* *copy-of-number-continuations*))
-    (call-next-method)))
-
-(defmethod print-object :around ((lvar sb-c::lvar) stream)
-  (let ((sb-c::*continuation-numbers* *copy-of-continuation-numbers*)
-	( sb-c::*number-continuations* *copy-of-number-continuations*))
-    (call-next-method)))
-
-(defmethod print-object :around ((cblock sb-c::cblock) stream)
-  (let ((sb-c::*continuation-numbers* *copy-of-continuation-numbers*)
-	( sb-c::*number-continuations* *copy-of-number-continuations*))
-    (call-next-method)))
+(macrolet ((def (ir1)
+	     `(defmethod print-object :around ((ctran ,ir1) stream)
+		(let ((sb-c::*continuation-numbers* *copy-of-continuation-numbers*)
+		      ( sb-c::*number-continuations* *copy-of-number-continuations*))
+		  (call-next-method)))))
+  (def sb-c::ctran)
+  (def sb-c::lvar)
+  (def sb-c::cblock))
 
 (define-presentation-method present (ir1 (type ir1) stream view &key acceptably)
   (declare (ignorable acceptably))
@@ -387,7 +478,11 @@
     (draw-circle* stream
 		  (center-of (min-x it) (max-x it))
 		  (center-of (min-y it) (max-y it))
-		  (center-of (max-x it) (- (min-x it))))))
+		  (center-of (max-y it) (- (min-y it)))
+		  :filled nil)
+    (let* ((rb (region-cblock (sb-c::node-block node)))
+	   (nb (make-bounding-rectangle (min-x rb) (min-y it) (max-x rb) (max-y it))))
+      (draw-text-in-bounding-rectangle* stream (label-ir1 node) nb :center :align-x :center :align-y :center))))
 
 (define-ir1-presentation-method present (ctran (type (sb-c::ctran)) stream (view (eql +flow-view+)) &key acceptably)
   (declare (ignorable acceptably))
@@ -411,7 +506,7 @@
 	       (with-valid-region (region-component component)
 		 (let* ((component-height (- (max-y it) (min-y it)))
 			(lvar-length (sqrt (+ (* (- x2 x1) (- x2 x1)) (* (- y2 y1) (- y2 y1)))))
-			(lvar-shift (/ (* 3 *flow-x-spacing* lvar-length) component-height)))
+			(lvar-shift (/ (* *flow-lvar-x-spacing-ratio* *flow-x-spacing* lvar-length) component-height)))
 		   (draw-line* stream
 			       x1 y1
 			       (- x1 lvar-shift) (if (> y1 y2) (- y1 lvar-shift) (+ y1 lvar-shift))
@@ -430,16 +525,16 @@
 				:ink +green+))))))
        it))))
 
-(define-ir1-presentation-method present (c (type (sb-c::cblock sb-c::component sb-c::clambda)) stream (view (eql +flow-view+)) &key acceptably)
+(define-ir1-presentation-method present (c (type (sb-c::cblock sb-c::component sb-c::functional)) stream (view (eql +flow-view+)) &key acceptably)
   (declare (ignorable acceptably))
   (with-valid-region (region-ir1 c)
     (draw-rectangle* stream
 		     (min-x it)
 		     (min-y it)
 		     (max-x it)
-		     (max-y it) 
+		     (max-y it)
 		     :filled nil)
-    (draw-text* stream (label-ir1 c) (+ (min-x it) 1) (+ (min-y it) 1) :align-x :left :align-y :top)))
+    (draw-text-in-bounding-rectangle* stream (label-ir1 c) it :topleft :align-x :left :align-y :top)))
 
 ;;; IR1 Extra Drawing
 (defgeneric draw-ir1-extra (ir1 &optional stream)
@@ -471,10 +566,15 @@
 
 ;;; IR1 Labels
 (defgeneric label-ir1 (ir1)
-  (:method ((ir1 t)) ""))
+  (:method ((ir1 t)) "")
+  (:method :around ((ir1 t))
+	   (let ((*print-lines* *flow-print-lines*)
+		 (*print-level* *flow-print-level*)
+		 (*print-length* *flow-print-length*))
+	     (call-next-method))))
 
-(defmethod label-ir1 ((ir1 sb-c::clambda))
-  (format nil "~a:~a" (type-of ir1) (or (sb-c::lambda-%debug-name ir1) (sb-c::lambda-%source-name ir1))))
+(defmethod label-ir1 ((ir1 sb-c::functional))
+  (format nil "~a:~a" (type-of ir1) (or (sb-c::functional-%debug-name ir1) (sb-c::functional-%source-name ir1))))
 
 (defmethod label-ir1 ((ir1 sb-c::component))
   (format nil "~a:~a" (type-of ir1) (sb-c::component-name ir1)))
@@ -483,17 +583,23 @@
   (format nil "~a" (type-of ir1)))
 
 (defmethod label-ir1 ((ir1 sb-c::node))
-  (format nil "~a:~a" (type-of ir1) (sb-c::node-source-form ir1)))
-
+  (handler-case (let ((form (sb-c::node-source-form ir1)))
+		  (format nil "~a:~a" (type-of ir1)
+			  (if (sb-c::leaf-p form)
+			      (or (sb-c::leaf-%debug-name form) (sb-c::leaf-%source-name form))
+			      form)))
+    (error () (format nil "~a" (type-of ir1)))))
 
 ;;; Top Interface
+
+;;; Clim GUI
 (define-condition view-ir1 (simple-condition)
   ((clambda :initarg :clambda :reader clambda)))
 
-(defmacro view-ir1 (form-being-compiled)
+(defmacro view (form-being-compiled)
   (with-unique-names (make-functional-from-toplevel-lambda %simple-eval)
     `(progn
-       (eval-when (:compile-toplevel :execute) 
+       (eval-when (:compile-toplevel :execute)
 	 (unlock-package (find-package :sb-c))
 	 (unlock-package (find-package :sb-impl))
 	 
@@ -503,8 +609,18 @@
 	    (symbol-function 'sb-impl::%simple-eval)
 	    (lambda (expr lexenv)
 	      (setf (symbol-function 'sb-impl::%simple-eval) ,%simple-eval)
-	      (handler-case (let ((*error-output* (make-string-output-stream))) (funcall ,%simple-eval expr lexenv))
-	     	(view-ir1 (clambda) (print-log "ok.") clambda)))
+	      (handler-case (let ((*error-output* (make-string-output-stream)))
+			      (funcall ,%simple-eval expr lexenv))
+		(condition () (print-log "returning~%")
+			   ,(cond
+			     ((eq (car form-being-compiled) 'defun)
+			      `(symbol-function (compile ',(cadr form-being-compiled) (lambda ,(caddr form-being-compiled) ,@(cdddr form-being-compiled)))))
+			     ((eq (car form-being-compiled) 'lambda)
+			      `(compile nil ,form-being-compiled))
+			     ((eq (car form-being-compiled) 'eval-when)
+			      `(compile nil (lambda () ,@(cddr form-being-compiled))))
+			     (t
+			      `(compile nil (lambda () ,form-being-compiled)))))))
 	    
 	    (symbol-function 'sb-c::make-functional-from-toplevel-lambda)
 	    (lambda (lambda-expression &key name (path (sb-c::missing-arg)))
@@ -513,10 +629,46 @@
 	      (let ((clambda (funcall ,make-functional-from-toplevel-lambda lambda-expression :name name :path path)))
 		(setf *copy-of-continuation-numbers* sb-c::*continuation-numbers*
 		      *copy-of-number-continuations* sb-c::*number-continuations*)
-		(view clambda)
 		(print-log "viewing ~a~%" clambda)
+		(run-viewer clambda)
+		
 		(signal 'view-ir1 :clambda clambda)
 		clambda)))))
-       (if (eq ',(car form-being-compiled) 'lambda)
-	   ,form-being-compiled
-	   (lambda () ,form-being-compiled)))))
+       ,(cond ((member (car form-being-compiled) '(defun lambda named-lambda))
+	       form-being-compiled)
+	      ((eq (car form-being-compiled) 'eval-when)
+	       `(lambda () ,@(cddr form-being-compiled)))
+	      (t
+	       `(lambda () ,form-being-compiled))))))
+
+;;; Dump PS file
+(defmethod window-clear (pane) nil)
+
+(defmacro dump (body &key (to-dir "~/"))
+  (with-unique-names (make-functional-from-toplevel-lambda fmake-functional-from-toplevel-lambda)
+    `(progn
+       (unlock-package (find-package :sb-c))
+       (defparameter ,make-functional-from-toplevel-lambda (symbol-function 'sb-c::make-functional-from-toplevel-lambda))
+       (defun ,fmake-functional-from-toplevel-lambda (lambda-expression &key name (path (sb-c::missing-arg)))
+	 (setf (symbol-function 'sb-c::make-functional-from-toplevel-lambda) ,make-functional-from-toplevel-lambda)
+	 (print-log "compiling ~a~%" lambda-expression)
+	 (let* ((clambda (funcall ,make-functional-from-toplevel-lambda lambda-expression :name name :path path))
+		(ps (merge-pathnames (pathname (format nil "~a-~a.ps" 
+						    (sb-c::component-name (sb-c::lambda-component clambda))
+						    (sb-kernel::get-lisp-obj-address (sb-c::lambda-component clambda))))
+				  ,to-dir)))
+	   (print-log "dumping ~a to ~a ~%" clambda ps)
+	   (progn (with-open-file (f ps :direction :output :if-exists :supersede :if-does-not-exist :create)
+		    (let ((*flow-print-level* nil)
+			  (*flow-print-length* nil))
+		     (with-output-to-postscript-stream (s f :device-type :eps)
+		       (draw-flow (make-ir1-flow clambda) s)))))
+	   (setf (symbol-function 'sb-c::make-functional-from-toplevel-lambda) #',fmake-functional-from-toplevel-lambda)
+	   (print-log "returning ~%")
+	   clambda))
+       ((lambda ()
+	  (unwind-protect
+	       (progn
+		 (setf (symbol-function 'sb-c::make-functional-from-toplevel-lambda) #',fmake-functional-from-toplevel-lambda)
+		 (eval ',body)
+		 (setf (symbol-function 'sb-c::make-functional-from-toplevel-lambda) ,make-functional-from-toplevel-lambda))))))))

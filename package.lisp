@@ -8,5 +8,6 @@
 		#:with-unique-names)
   (:import-from #:sb-ext
 		#:unlock-package)
-  (:export #:view-ir1))
+  (:export #:view
+	   #:dump))
 
