@@ -623,11 +623,11 @@
 		(cy1 (max-y pred-it))
 		(cx2 (center-of (min-x it) (max-x it)))
 		(cy2 (min-y it)))
-	    (draw-connector stream ""
+	    (draw-connector stream "not implemented :("
 			    (make-point cx1 cy1) (make-point cx2 cy2)
 			    (region-component (sb-c::block-component cblock))
 			    :ink +blue+
-			    :line-dashes #b10
+			    :line-dashes '(#b101)
 			    :bounds (list-all-cblocks-regions (cdr ir1-flow))
 			    :step (/ *flow-block-x-spacing* 4))))))))
 
@@ -643,7 +643,7 @@
 		       (center-of (min-x it) (max-x it))
 		       (min-y it)
 		       :ink +blue+
-		       :line-dashes #b10))))))
+		       :line-dashes '(#b101)))))))
 
 ;;; IR1 Labels
 (defgeneric label-ir1 (ir1)
