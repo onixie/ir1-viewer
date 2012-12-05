@@ -86,79 +86,110 @@
       (make-point (center-of sx ex) (center-of sy ey)))))
 
 (defun draw-text-in-bounding-rectangle* (stream text bound location &rest args)
-  (let ((old-size (getf args :text-size 256))
-	(record (with-output-to-output-record (stream) (apply #'draw-text* stream text
-							      (case location
-								((:bottomleft :topleft) (1+ (min-x bound)))
-								((:bottomright :topright) (1- (max-x bound)))
-								(t (center-of (min-x bound) (max-x bound))))
-							      (case location
-								((:topright :topleft) (1+ (min-y bound)))
-								((:bottomright :bottomleft) (1- (max-y bound)))
-								(t (center-of (min-y bound) (max-y bound)))) args))))
-    (when (or (< (bounding-rectangle-width (bounding-rectangle record)) (* *flow-current-scaling* (bounding-rectangle-width bound)))
+  (let* ((old-size (getf args :text-size 256))
+	 (record (with-output-to-output-record (stream) (apply #'draw-text* stream text
+							       (case location
+								 ((:bottomleft :topleft) (1+ (min-x bound)))
+								 ((:bottomright :topright) (1- (max-x bound)))
+								 (t (center-of (min-x bound) (max-x bound))))
+							       (case location
+								 ((:topright :topleft) (1+ (min-y bound)))
+								 ((:bottomright :bottomleft) (1- (max-y bound)))
+								 (t (center-of (min-y bound) (max-y bound)))) args)))
+	 (rec-bound (bounding-rectangle record))
+	 (rec-bound-width (bounding-rectangle-width rec-bound)) 
+	 (text-x (case location
+		   ((:bottomleft :topleft) (1+ (min-x bound)))
+		   ((:bottomright :topright) (1- (max-x bound)))
+		   (t (center-of (min-x bound) (max-x bound)))))
+	 (text-y (case location
+		   ((:topright :topleft) (1+ (min-y bound)))
+		   ((:bottomright :bottomleft) (1- (max-y bound)))
+		   (t (center-of (min-y bound) (max-y bound))))))
+    (when (or (< rec-bound-width (* *flow-current-scaling* (bounding-rectangle-width bound)))
 	      (< old-size 4))
-      (apply #'draw-text* stream text
-	     (case location
-	       ((:bottomleft :topleft) (1+ (min-x bound)))
-	       ((:bottomright :topright) (1- (max-x bound)))
-	       (t (center-of (min-x bound) (max-x bound))))
-	     (case location
-	       ((:topright :topleft) (1+ (min-y bound)))
-	       ((:bottomright :bottomleft) (1- (max-y bound)))
-	       (t (center-of (min-y bound) (max-y bound)))) args)
-
+      (apply #'draw-text* stream text text-x text-y args)
       (return-from draw-text-in-bounding-rectangle* nil))
     (setf (getf args :text-size) (ceiling (- old-size 1)))
     (apply #'draw-text-in-bounding-rectangle* stream text bound location args)))
 
 (defun find-path (start end step obstacles bound)
   (labels ((dist (p)
-	     (sqrt (+ (* (- (point-x end) (point-x p)) (- (point-x end) (point-x p)))
-	    	      (* (- (point-y end) (point-y p)) (- (point-y end) (point-y p))))))
+	     (sqrt (+ (* (- (point-x end) (point-x p))
+			 (- (point-x end) (point-x p)))
+	    	      (* (- (point-y end) (point-y p))
+			 (- (point-y end) (point-y p))))))
 	   (dist< (p1 p2)
 	     (< (dist p1) (dist p2)))
-	   (not-valid-walk-p (p obs)
-	     (or (not (region-contains-region-p bound p))
-		 (some (lambda (o) (region-contains-region-p o p)) obs)))
-	   (walk (p path)
-	     (stable-sort (remove-if (lambda (p)
-				       (not-valid-walk-p p (append path obstacles)))
-				     (list (make-point (point-x p) (+ (point-y p) step))
-					   (make-point (point-x p) (- (point-y p) step))
-					   (make-point (+ (point-x p) step) (point-y p))
-					   (make-point (- (point-x p) step) (point-y p))))
-			  #'dist<))
-	   (coline (&rest args)
-	     (or (every (lambda (p1 p2) (= (point-x p1) (point-x p2))) args (rest args))
-		 (every (lambda (p1 p2) (= (point-y p1) (point-y p2))) args (rest args))))
-	   (join (path)
-	     (do* ((p1 path)
-		   (p2 (cdr p1) (cdr p1))
-		   (p3 (cddr p1) (cddr p1)))
-		  ((null p3) path)
-	       (if (coline (first p1) (first p2) (first p3))
-		   (rplacd p1 p3)
-		   (setf p1 (cdr p1)))))
-	   (smoothy (path)
-	     (do* ((p1 (cdr path) (cdr p1))
-		   (p2 (cdr p1) (cdr p1))
-		   (p3 (cddr p1) (cddr p1)))
-		  ((or (null p3) (region-contains-region-p (first p3) start)) path)
-	       (cond ((coline (first p1) (first p3))
-		      (setf p1 (cdr p1)))
-		     (t (let* ((p4 (make-point (point-x (first p1)) (point-y (first p3))))
-			       (p5 (make-point (point-x (first p3)) (point-y (first p1))))
-			       (p6 (if (not-valid-walk-p p4 (append path obstacles)) p5 p4)))
-			  (rplaca p2 p6)
-			  (rplacd p2 (cdr p3)))))))
+	   (valid-walk-p (p1 p2 obs)
+	     (let ((p12 (make-line p1 p2)))
+	       (and (region-contains-region-p bound p12)
+		    (every (lambda (o)
+			     (or (eq o p1)
+				 (and (not (region-contains-region-p o p2))
+				      (not (region-intersects-region-p o p12)))))
+			   obs))))
+	   (coline-p (&rest args)
+	     (or (every (lambda (p1 p2)
+			  (= (point-x p1) (point-x p2)))
+			args (rest args))
+		 (every (lambda (p1 p2)
+			  (= (point-y p1) (point-y p2)))
+			args (rest args))))
+	   (walk (p1 path)
+	     (stable-sort
+	      (remove-if-not
+	       (lambda (p2)
+		 (valid-walk-p p1 p2 (append path obstacles)))
+	       (mapcar #'make-point
+		       (list (point-x p1)           (point-x p1)          (+ (point-x p1) step) (- (point-x p1) step))
+		       (list (+ (point-y p1) step) (- (point-y p1) step) (point-y p1)          (point-y p1))))
+	      #'dist<))
+	   (smooth-until-done (path)
+	     (let ((smoothed nil))
+	       (flet ((join (path)
+			(do* ((p1 path)
+			      (p2 (cdr p1) (cdr p1))
+			      (p3 (cddr p1) (cddr p1)))
+			     ((null p3) path)
+			  (if (coline-p (first p1) (first p2) (first p3))
+			      (progn
+				(rplacd p1 p3)
+				(setf smoothed nil))
+			      (setf p1 (cdr p1)))))
+		      (smoothy (path)
+			(setf smoothed t)
+			(do* ((p1 (cdr path) (cdr p1))
+			      (p2 (cdr p1) (cdr p1))
+			      (p3 (cddr p1) (cddr p1)))
+			     ((or (null p3) (region-contains-region-p (first p3) start)) path)
+			  (cond ((coline-p (first p1) (first p2) (first p3)) nil)
+				(t (let* ((p4 (make-point (point-x (first p1)) (point-y (first p3))))
+					  (p5 (make-point (point-x (first p3)) (point-y (first p1))))
+					  (obs (append path obstacles)))
+				     (cond ((and (valid-walk-p (first p1) p4 obs)
+						 (valid-walk-p (first p3) p4 obs))
+					    (rplaca p2 p4)
+					    (rplacd p2 (cdr p3))
+					    (setf smoothed nil))
+					   ((and (valid-walk-p (first p1) p5 obs)
+						 (valid-walk-p (first p3) p5 obs))
+					    (rplaca p2 p5)
+					    (rplacd p2 (cdr p3))
+					    (setf smoothed nil)))))))))
+		 (do () (smoothed path)
+		   (setf path (join (smoothy path)))))))
 	   (find-1 (p path)
 	     (setf path (cons p path))
 	     (when (<= (dist p) step)
-	       (return-from find-path (join (smoothy (if (region-contains-region-p end (first path))
-						    path
-						    (cons end path))))))
-	     (mapcar (lambda (sp) (find-1 sp path)) (walk p path))))
+	       (return-from find-path
+		 (smooth-until-done
+		  (if (region-contains-region-p end (first path))
+		      path
+		      (cons end path)))))
+	     (mapcar (lambda (sp)
+		       (find-1 sp path))
+		     (walk p path))))
     (find-1 start nil)))
 
 (defun draw-connector (stream text start-point end-point limit-bound &rest args &key (bounds (list +nowhere+)) (step 1) &allow-other-keys)
@@ -170,6 +201,22 @@
 	 (lambda (p1 p2)
 	   (apply #'draw-arrow stream p1 p2 args))
 	 it (rest it))))
+
+(defgeneric region-clear (pane region)
+  (:method ((pane t) region) (declare (ignore pane region)) nil) 
+  (:method ((pane clim-stream-pane) (region output-record))
+    (let ((bound (bounding-rectangle region))
+	  (top (stream-output-history pane)))
+      (medium-clear-area (sheet-medium pane)
+			 (bounding-rectangle-min-x bound)
+			 (bounding-rectangle-min-y bound)
+			 (bounding-rectangle-max-x bound)
+			 (bounding-rectangle-max-y bound))
+      (map-over-output-records-overlapping-region
+       (lambda (record)
+	 (unless (eq region record)
+	   (replay-output-record record pane)))
+       top region))))
 
 (defmacro size-of ((stream) &body body)
   `(let ((record (with-output-to-output-record (,stream)
@@ -298,8 +345,7 @@
 		       (list*
 			(sb-c::optional-dispatch-main-entry functional)
 			(sb-c::optional-dispatch-more-entry functional)
-			(remove-if-not #'sb-c::functional-p
-				       (sb-c::optional-dispatch-entry-points functional)))))
+			(mapcar #'sb-c::force (sb-c::optional-dispatch-entry-points functional)))))
 	      :initial-value +nowhere+)
       :x-ratio *flow-clambda-margin-ratio-x*
       :y-ratio *flow-clambda-margin-ratio-y*))))
@@ -456,6 +502,7 @@
 (define-ir1-viewer-command (com-quit :menu t :keystroke :q) ()
   (frame-exit *application-frame*))
 
+;;; IR1 Presentation
 (labels ((present-instance-slots-clim (thing stream)
            (let ((slots (clim-mop:class-slots (class-of thing))))
              (formatting-table (stream)
@@ -488,21 +535,14 @@
   (defmethod describe-object ((thing structure-object) (stream application-pane))
     (describe-instance thing "a structure" stream)))
 
-;;; IR1 Presentation
+(defstruct (ir1 (:constructor make-ir1 ())) (|bogus-can't-be-instantiated| (error "ir1 is not a concrete ir1 thing.")))
+
 (defmacro define-ir1-presentation-type ((&rest types) &rest args)
   `(eval-when (:compile-toplevel :load-toplevel :execute)
      ,@(when types
 	     `((define-presentation-type ,(car types) ,@args)
 	       (define-ir1-presentation-type ,(cdr types) ,@args)))
      nil))
-
-(defmacro define-ir1-presentation-method (method-name (ir1 (type (&rest types)) &rest args) &body body)
-  `(eval-when (:compile-toplevel :load-toplevel :execute)
-     ,@(when types
-	     `((define-presentation-method ,method-name (,ir1 (,type ,(car types)) ,@args) ,@body)
-	       (define-ir1-presentation-method ,method-name (,ir1 (,type ,(cdr types)) ,@args) ,@body)))))
-
-(defstruct (ir1 (:constructor make-ir1 ())) (|bogus-can't-be-instantiated| (error "ir1 is not a concrete ir1 thing.")))
 
 (define-ir1-presentation-type (ir1) ())
 
@@ -545,20 +585,44 @@
   (declare (ignorable acceptably))
   (print ir1))
 
-(define-ir1-presentation-method present (node (type (sb-c::node)) stream (view (eql +flow-view+)) &key acceptably)
-  (declare (ignorable acceptably))
+(defmacro define-ir1-presentation (((&rest types) stream) &body body)
+  `(eval-when (:compile-toplevel :load-toplevel :execute)
+     ,@(when (and types
+		  (/= 0 (or (position :as types) -1)))
+	     (let* ((as-nm (cadr (member :as types)))
+		    (type-nm (car types))
+		    (draw-fn (symbolicate 'draw- type-nm))
+		    (sb-type (intern (symbol-name type-nm) :sb-c)))
+	       `((defun ,draw-fn (,(or as-nm type-nm) ,stream) ,@body)
+		 (define-presentation-method present (,type-nm (type ,sb-type) stream (view (eql +flow-view+)) &key acceptably)
+		   (declare (ignore acceptably))
+		   (funcall #',draw-fn ,type-nm stream))
+		 (define-presentation-method highlight-presentation
+		     ((type ,sb-type) record stream state)
+		   (let ((component-region (region-component (car (ir1-flow *application-frame*))))
+			 (ir1 (presentation-object record))
+			 (reg (bounding-rectangle record)))
+		     (case state
+		       (:highlight (region-clear stream record)
+				   (with-scaling (stream *flow-current-scaling*)
+				     (with-translation (stream (- (min-x component-region)) (- (min-y component-region)))
+				       (with-drawing-options (stream :line-thickness 2 :ink +red+ :text-face :bold)
+					 (funcall #',draw-fn ir1 stream)))))
+		       (t (repaint-sheet stream (make-bounding-rectangle (1- (min-x reg)) (1- (min-y reg)) (max-x reg) (max-y reg)))))))
+		 (define-ir1-presentation (,(cdr types) stream) ,@body))))))
+
+(define-ir1-presentation ((node) stream)
   (with-valid-region (region-node node)
+    (let* ((rb (region-cblock (sb-c::node-block node)))
+	   (nb (make-bounding-rectangle (min-x rb) (min-y it) (max-x rb) (max-y it))))
+      (draw-text-in-bounding-rectangle* stream (label-ir1 node) nb :center :align-x :center :align-y :center))
     (draw-circle* stream
 		  (center-of (min-x it) (max-x it))
 		  (center-of (min-y it) (max-y it))
 		  (center-of (max-y it) (- (min-y it)))
-		  :filled nil)
-    (let* ((rb (region-cblock (sb-c::node-block node)))
-	   (nb (make-bounding-rectangle (min-x rb) (min-y it) (max-x rb) (max-y it))))
-      (draw-text-in-bounding-rectangle* stream (label-ir1 node) nb :center :align-x :center :align-y :center))))
+		  :filled nil)))
 
-(define-ir1-presentation-method present (ctran (type (sb-c::ctran)) stream (view (eql +flow-view+)) &key acceptably)
-  (declare (ignorable acceptably))
+(define-ir1-presentation ((ctran) stream)
   (with-valid-region (region-ctran ctran)
     (draw-arrow stream
 		(line-start-point it)
@@ -566,8 +630,7 @@
 		:ink +red+)
     (draw-text stream (label-ir1 ctran) (line-middle-point it) :align-x :left :align-y :center)))
 
-(define-ir1-presentation-method present (lvar (type (sb-c::lvar)) stream (view (eql +flow-view+)) &key acceptably)
-  (declare (ignorable acceptably))
+(define-ir1-presentation ((lvar) stream)
   (let ((uses (previous-of lvar)))
     (with-valid-region (region-lvar lvar)
       (map-over-polyline
@@ -599,16 +662,15 @@
 				:ink +green+))))))
        it))))
 
-(define-ir1-presentation-method present (c (type (sb-c::cblock sb-c::component sb-c::functional)) stream (view (eql +flow-view+)) &key acceptably)
-  (declare (ignorable acceptably))
-  (with-valid-region (region-ir1 c)
+(define-ir1-presentation ((cblock component functional :as ir1) stream)
+  (with-valid-region (region-ir1 ir1)
+    (draw-text-in-bounding-rectangle* stream (label-ir1 ir1) it :topleft :align-x :left :align-y :top)
     (draw-rectangle* stream
 		     (min-x it)
 		     (min-y it)
 		     (max-x it)
 		     (max-y it)
-		     :filled nil)
-    (draw-text-in-bounding-rectangle* stream (label-ir1 c) it :topleft :align-x :left :align-y :top)))
+		     :filled nil)))
 
 ;;; IR1 Extra Drawing
 (defgeneric draw-ir1-extra (ir1 &optional stream ir1-flow)
@@ -655,20 +717,44 @@
 	     (call-next-method))))
 
 (defmethod label-ir1 ((ir1 sb-c::functional))
-  (format nil "~a:~a" (type-of ir1) (or (sb-c::functional-%debug-name ir1) (sb-c::functional-%source-name ir1))))
+  (format nil "~a:~s {~x}" (type-of ir1) (or (sb-c::functional-%debug-name ir1) (sb-c::functional-%source-name ir1)) (sb-c::get-lisp-obj-address ir1)))
 
 (defmethod label-ir1 ((ir1 sb-c::component))
-  (format nil "~a:~a" (type-of ir1) (sb-c::component-name ir1)))
+  (format nil "~a:~s" (type-of ir1) (sb-c::component-name ir1)))
 
 (defmethod label-ir1 ((ir1 sb-c::cblock))
   (format nil "~a" (type-of ir1)))
 
 (defmethod label-ir1 ((ir1 sb-c::node))
-  (handler-case (let ((form (sb-c::node-source-form ir1)))
-		  (format nil "~a:~a" (type-of ir1)
-			  (if (sb-c::leaf-p form)
-			      (or (sb-c::leaf-%debug-name form) (sb-c::leaf-%source-name form))
-			      form)))
+  (handler-case (if (sb-c::ref-p ir1)
+		    (let ((leaf (sb-c::ref-leaf ir1)))
+		      (if (sb-c::functional-p leaf)
+			  (format nil "~a:~s {~x}"
+				  (type-of ir1)
+				  (or (sb-c::functional-%debug-name leaf) (sb-c::functional-%source-name leaf))
+				  (sb-c::get-lisp-obj-address leaf))
+			  (if (sb-c::constant-p leaf)
+			      (format nil "~a:~a"
+				      (type-of ir1)
+				      (let ((value (sb-c::constant-value leaf)))
+					(if (consp value)
+					    (format nil "(LIST ~{~s~^ ~s~})"
+						    (mapcar (lambda (val)
+							      (if (sb-c::leaf-p val)
+								  (sb-c::leaf-%source-name val)
+								  val)) value))
+					    (format nil "~s"
+						    (if (sb-c::leaf-p value)
+							(sb-c::leaf-%source-name value)
+							value)))))
+			      (format nil "~a:~s"
+				      (type-of ir1)
+				      (sb-c::leaf-%source-name leaf)))))
+		    (let ((form (sb-c::node-source-form ir1)))
+		      (format nil "~a:~s" (type-of ir1)
+			      (if (sb-c::leaf-p form)
+				  (or (sb-c::leaf-%debug-name form) (sb-c::leaf-%source-name form))
+				  form))))
     (error () (format nil "~a" (type-of ir1)))))
 
 ;;; Top Interface
